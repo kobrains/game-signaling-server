@@ -1,0 +1,15 @@
+{
+  "name": "game-signaling-server",
+  "version": "1.0.0",
+  "description": "WebRTC signaling server for grid strategy game",
+  "main": "signal_server.js",
+  "scripts": {
+    "start": "node signal_server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
