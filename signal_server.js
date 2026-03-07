@@ -1,6 +1,7 @@
 const { WebSocketServer } = require('ws');
 const { randomUUID }       = require('crypto');
 const https                = require('https');
+const http                 = require('http');
 const os                   = require('os');
 
 // Railway (and most cloud platforms) inject a PORT env var.
@@ -24,6 +25,11 @@ function getLanIp() {
   return '127.0.0.1'; // fallback: same machine only
 }
 const LAN_IP = getLanIp();
+
+// To find your secret key: Metered dashboard → Settings → Secret Key
+// Set as env var METERED_SECRET_KEY in Railway for production.
+const METERED_APP_NAME  = process.env.METERED_APP_NAME  || 'YOUR_APP_NAME';
+const METERED_SECRET_KEY = process.env.METERED_SECRET_KEY || '';
 
 // ─── Metered TURN credentials ─────────────────────────────────────────────────
 // Dynamic fetch — the signaling server fetches fresh credentials from Metered
@@ -109,13 +115,92 @@ fetchIceServers().then(() => {
   if (!IS_LOCAL) setInterval(fetchIceServers, ICE_REFRESH_INTERVAL);
 });
 
+// ─── Metered TURN usage ───────────────────────────────────────────────────────
+// Fetches real billing-cycle usage from Metered and caches it server-side.
+// Clients poll GET /turn-usage — the signaling server proxies so the secret key
+// never leaves the server.
+
+const USAGE_REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
+let _cachedUsage = null; // { quotaInGB, usageInGB, overageInGB, fetchedAt }
+
+function fetchMeteredUsage() {
+  if (IS_LOCAL || !METERED_SECRET_KEY) return Promise.resolve();
+
+  const url = `https://${METERED_APP_NAME}.metered.live/api/v1/turn/current_usage?secretKey=${METERED_SECRET_KEY}`;
+
+  return new Promise((resolve) => {
+    https.get(url, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (typeof parsed.usageInGB === 'number') {
+            _cachedUsage = { ...parsed, fetchedAt: Date.now() };
+            console.log(`[Usage] Metered: ${parsed.usageInGB.toFixed(3)} GB / ${parsed.quotaInGB} GB`);
+          } else {
+            console.warn('[Usage] Unexpected Metered response:', data);
+          }
+        } catch {
+          console.warn('[Usage] Failed to parse Metered usage response');
+        }
+        resolve();
+      });
+    }).on('error', (err) => {
+      console.error('[Usage] Failed to fetch Metered usage:', err.message);
+      resolve(); // non-fatal
+    });
+  });
+}
+
+fetchMeteredUsage().then(() => {
+  if (!IS_LOCAL && METERED_SECRET_KEY) setInterval(fetchMeteredUsage, USAGE_REFRESH_INTERVAL);
+});
+
+// ─── HTTP + WebSocket server ──────────────────────────────────────────────────
+// A single HTTP server handles both:
+//   GET /turn-usage  → proxied Metered usage (JSON, CORS-open for localhost dev)
+//   All other paths  → WebSocket upgrade for signaling
+
+const httpServer = http.createServer((req, res) => {
+  // CORS headers — the game client is a browser file:// or localhost origin
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET');
+
+  if (req.method === 'GET' && req.url === '/turn-usage') {
+    res.setHeader('Content-Type', 'application/json');
+    if (!_cachedUsage) {
+      // Not yet fetched (local mode or key not set) — return nulls so the
+      // monitor can show a "not available" state rather than crashing.
+      res.writeHead(200);
+      res.end(JSON.stringify({ quotaInGB: null, usageInGB: null, overageInGB: null, fetchedAt: null }));
+    } else {
+      res.writeHead(200);
+      res.end(JSON.stringify(_cachedUsage));
+    }
+    return;
+  }
+
+  // All other HTTP requests: 404
+  res.writeHead(404);
+  res.end('Not found');
+});
+
 // ─── Limits ───────────────────────────────────────────────────────────────────
 const MAX_ROOM_SIZE      = 8;
 const MAX_ROOM_ID_LEN    = 64;
 const RATE_LIMIT_WINDOW  = 1000; // ms
 const RATE_LIMIT_MAX_MSG = 30;
 
-const wss = new WebSocketServer({ port: PORT });
+const wss = new WebSocketServer({ server: httpServer });
+
+httpServer.listen(PORT, () => {
+  const mode = IS_LOCAL
+    ? `LOCAL (host candidates only) -- LAN address: ws://${LAN_IP}:${PORT}`
+    : 'PRODUCTION (Metered TURN)';
+  console.log(`Signaling server running on port ${PORT} -- ${mode}`);
+});
 
 const rooms = new Map(); // roomId -> Set of sockets
 
@@ -203,8 +288,3 @@ wss.on('connection', (ws) => {
     }
   });
 });
-
-const mode = IS_LOCAL
-  ? `LOCAL (host candidates only) -- LAN address: ws://${LAN_IP}:${PORT}`
-  : 'PRODUCTION (Metered TURN)';
-console.log(`Signaling server running on port ${PORT} -- ${mode}`);
