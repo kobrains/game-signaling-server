@@ -1,23 +1,82 @@
 const { WebSocketServer } = require('ws');
 const { randomUUID }       = require('crypto');
 const https                = require('https');
+const os                   = require('os');
 
 // Railway (and most cloud platforms) inject a PORT env var.
 // Fall back to 3000 for local development.
-// wss://game-signaling-server-production.up.railway.app
+// Production: wss://game-signaling-server-production.up.railway.app
 const PORT = process.env.PORT || 3000;
 
-// ─── Metered TURN credentials ─────────────────────────────────────────────────
-const METERED_API_URL =
-  'https://kyleogata_turnserver.metered.live/api/v1/turn/credentials?apiKey=b43908569ccfe4d1d72a4b8d4d8452bf248c';
+// Set RAILWAY_ENVIRONMENT (Railway injects this automatically) or LOCAL=true to skip Metered.
+const IS_LOCAL = !process.env.RAILWAY_ENVIRONMENT && !process.env.METERED_FORCE;
 
-// Cache credentials in memory — Metered credentials are valid for 24h.
-// Refresh every 12h so they never expire mid-session.
+// ─── LAN IP detection ─────────────────────────────────────────────────────────
+// Find the first non-loopback IPv4 address — this is the LAN address clients
+// on the same network should use to connect to this signaling server.
+function getLanIp() {
+  const ifaces = os.networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    for (const iface of ifaces[name]) {
+      if (iface.family === 'IPv4' && !iface.internal) return iface.address;
+    }
+  }
+  return '127.0.0.1'; // fallback: same machine only
+}
+const LAN_IP = getLanIp();
+
+// ─── Metered TURN credentials ─────────────────────────────────────────────────
+// Dynamic fetch — the signaling server fetches fresh credentials from Metered
+// on startup and every 12 hours. Replace the API URL with your Metered app name
+// and API key when you rotate accounts.
+//
+// To find your API URL: Metered dashboard → TURN → Credentials → "API Integration"
+// Format: https://YOUR_APP_NAME.metered.live/api/v1/turn/credentials?apiKey=YOUR_KEY
+const METERED_API_URL =
+  'https://YOUR_APP_NAME.metered.live/api/v1/turn/credentials?apiKey=YOUR_API_KEY';
+
+// Static fallback — used if the Metered API fetch fails at startup.
+// These credentials expire (Metered rotates them), so the dynamic fetch above
+// is the primary path. Update these whenever you rotate your Metered account.
+const STATIC_ICE_FALLBACK = [
+  { urls: 'stun:stun.relay.metered.ca:80' },
+  {
+    urls      : 'turn:global.relay.metered.ca:80',
+    username  : 'd1339c9f64c60c4b33b31b88',
+    credential: 'GTorfAcNMzcbffwu',
+  },
+  {
+    urls      : 'turn:global.relay.metered.ca:80?transport=tcp',
+    username  : 'd1339c9f64c60c4b33b31b88',
+    credential: 'GTorfAcNMzcbffwu',
+  },
+  {
+    urls      : 'turn:global.relay.metered.ca:443',
+    username  : 'd1339c9f64c60c4b33b31b88',
+    credential: 'GTorfAcNMzcbffwu',
+  },
+  {
+    urls      : 'turns:global.relay.metered.ca:443?transport=tcp',
+    username  : 'd1339c9f64c60c4b33b31b88',
+    credential: 'GTorfAcNMzcbffwu',
+  },
+];
+
+// LAN/local ICE: empty array = browser generates host candidates automatically.
+// No STUN needed on a local network — STUN finds your public IP, not LAN IP.
+// Keeping this empty makes LAN connections faster and works on offline networks.
+const LOCAL_ICE = [];
+
 const ICE_REFRESH_INTERVAL = 12 * 60 * 60 * 1000; // 12 hours
 
-let _cachedIceServers = [];
+let _cachedIceServers = LOCAL_ICE; // safe default for local; replaced by Metered on Railway
 
 function fetchIceServers() {
+  if (IS_LOCAL) {
+    console.log('[ICE] Local mode -- host candidates only, Metered skipped');
+    return Promise.resolve();
+  }
+
   return new Promise((resolve) => {
     https.get(METERED_API_URL, (res) => {
       let data = '';
@@ -29,44 +88,44 @@ function fetchIceServers() {
             _cachedIceServers = servers;
             console.log(`[ICE] Fetched ${servers.length} ICE servers from Metered`);
           } else {
-            console.warn('[ICE] Metered returned empty or invalid response — keeping previous cache');
+            console.warn('[ICE] Metered returned empty or invalid response -- using static fallback');
+            _cachedIceServers = STATIC_ICE_FALLBACK;
           }
         } catch {
-          console.warn('[ICE] Failed to parse Metered response — keeping previous cache');
+          console.warn('[ICE] Failed to parse Metered response -- using static fallback');
+          _cachedIceServers = STATIC_ICE_FALLBACK;
         }
         resolve();
       });
     }).on('error', (err) => {
-      console.error('[ICE] Failed to fetch from Metered:', err.message);
-      resolve(); // non-fatal — use cached value
+      console.error('[ICE] Failed to fetch from Metered:', err.message, '-- using static fallback');
+      _cachedIceServers = STATIC_ICE_FALLBACK;
+      resolve(); // non-fatal
     });
   });
 }
 
-// Fetch immediately on startup, then refresh every 12h
 fetchIceServers().then(() => {
-  setInterval(fetchIceServers, ICE_REFRESH_INTERVAL);
+  if (!IS_LOCAL) setInterval(fetchIceServers, ICE_REFRESH_INTERVAL);
 });
 
 // ─── Limits ───────────────────────────────────────────────────────────────────
-const MAX_ROOM_SIZE      = 8;    // hard cap on peers per room
-const MAX_ROOM_ID_LEN    = 64;   // max chars in a room ID
+const MAX_ROOM_SIZE      = 8;
+const MAX_ROOM_ID_LEN    = 64;
 const RATE_LIMIT_WINDOW  = 1000; // ms
-const RATE_LIMIT_MAX_MSG = 30;   // max messages per window per connection
+const RATE_LIMIT_MAX_MSG = 30;
 
 const wss = new WebSocketServer({ port: PORT });
 
-const rooms = new Map(); // roomId → Set of sockets
+const rooms = new Map(); // roomId -> Set of sockets
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Sanitise a roomId: strip to safe chars, enforce length. Returns '' on failure. */
 function sanitiseRoomId(raw) {
   if (typeof raw !== 'string') return '';
   return raw.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, MAX_ROOM_ID_LEN);
 }
 
-/** Simple per-socket token-bucket rate limiter. Returns true if the message is allowed. */
 function rateAllow(ws) {
   const now = Date.now();
   if (now - ws._rateBucketStart > RATE_LIMIT_WINDOW) {
@@ -81,12 +140,10 @@ function rateAllow(ws) {
 wss.on('connection', (ws) => {
   let currentRoom = null;
 
-  // Rate-limit state
   ws._rateBucketStart = Date.now();
   ws._rateBucketCount = 0;
 
   ws.on('message', (raw) => {
-    // Rate limiting — drop silently if exceeded
     if (!rateAllow(ws)) return;
 
     let msg;
@@ -109,11 +166,13 @@ wss.on('connection', (ws) => {
       const peerId = randomUUID();
       ws._peerId = peerId;
 
-      // Send peer ID and ICE servers together — client has everything it needs in one message
+      // Send peer ID, ICE servers, and (in local mode) the LAN address so the
+      // client UI can display the exact URL other players should connect to.
       ws.send(JSON.stringify({
         type      : 'ASSIGNED_PEER_ID',
         peerId,
         iceServers: _cachedIceServers,
+        lanAddress: IS_LOCAL ? `ws://${LAN_IP}:${PORT}` : null,
       }));
 
       for (const peer of rooms.get(currentRoom)) {
@@ -140,11 +199,12 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     if (currentRoom && rooms.has(currentRoom)) {
       rooms.get(currentRoom).delete(ws);
-      if (rooms.get(currentRoom).size === 0) {
-        rooms.delete(currentRoom);
-      }
+      if (rooms.get(currentRoom).size === 0) rooms.delete(currentRoom);
     }
   });
 });
 
-console.log(`Signaling server running on port ${PORT}`);
+const mode = IS_LOCAL
+  ? `LOCAL (host candidates only) -- LAN address: ws://${LAN_IP}:${PORT}`
+  : 'PRODUCTION (Metered TURN)';
+console.log(`Signaling server running on port ${PORT} -- ${mode}`);
