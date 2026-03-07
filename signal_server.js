@@ -125,7 +125,10 @@ const USAGE_REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
 let _cachedUsage = null; // { quotaInGB, usageInGB, overageInGB, fetchedAt }
 
 function fetchMeteredUsage() {
-  if (IS_LOCAL || !METERED_SECRET_KEY) return Promise.resolve();
+  if (!METERED_SECRET_KEY || METERED_APP_NAME === 'YOUR_APP_NAME') {
+    console.log('[Usage] Metered secret key not configured — skipping usage fetch');
+    return Promise.resolve();
+  }
 
   const url = `https://${METERED_APP_NAME}.metered.live/api/v1/turn/current_usage?secretKey=${METERED_SECRET_KEY}`;
 
@@ -155,7 +158,9 @@ function fetchMeteredUsage() {
 }
 
 fetchMeteredUsage().then(() => {
-  if (!IS_LOCAL && METERED_SECRET_KEY) setInterval(fetchMeteredUsage, USAGE_REFRESH_INTERVAL);
+  if (METERED_SECRET_KEY && METERED_APP_NAME !== 'YOUR_APP_NAME') {
+    setInterval(fetchMeteredUsage, USAGE_REFRESH_INTERVAL);
+  }
 });
 
 // ─── HTTP + WebSocket server ──────────────────────────────────────────────────
