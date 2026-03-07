@@ -26,24 +26,29 @@ function getLanIp() {
 }
 const LAN_IP = getLanIp();
 
-// To find your secret key: Metered dashboard → Settings → Secret Key
-// Set as env var METERED_SECRET_KEY in Railway for production.
-const METERED_APP_NAME  = process.env.METERED_APP_NAME  || 'YOUR_APP_NAME';
+// ─── Metered configuration ────────────────────────────────────────────────────
+// App name and API key: used to fetch fresh TURN credentials (safe to expose
+// in the server — the API key only grants credential generation, not billing).
+// Secret key: used server-side ONLY to fetch billing usage. Never sent to clients.
+//
+// Railway env vars to set:
+//   METERED_SECRET_KEY  → Metered dashboard → Settings → Secret Key
+//   (METERED_APP_NAME and METERED_API_KEY are hardcoded below as they are not sensitive)
+const METERED_APP_NAME   = process.env.METERED_APP_NAME  || 'kobrains';
+const METERED_API_KEY    = process.env.METERED_API_KEY   || '6c5b137a20495ab54e4826914e11af12904c';
 const METERED_SECRET_KEY = process.env.METERED_SECRET_KEY || '';
 
 // ─── Metered TURN credentials ─────────────────────────────────────────────────
-// Dynamic fetch — the signaling server fetches fresh credentials from Metered
-// on startup and every 12 hours. Replace the API URL with your Metered app name
-// and API key when you rotate accounts.
-//
-// To find your API URL: Metered dashboard → TURN → Credentials → "API Integration"
-// Format: https://YOUR_APP_NAME.metered.live/api/v1/turn/credentials?apiKey=YOUR_KEY
+// Dynamic fetch — the signaling server fetches fresh short-lived credentials
+// from Metered on startup and every 12 hours. The API key is used here (not
+// the secret key). Credentials are sent to clients via the WebSocket JOIN_ROOM
+// response, so the secret key is never exposed to the browser.
 const METERED_API_URL =
-  'https://YOUR_APP_NAME.metered.live/api/v1/turn/credentials?apiKey=YOUR_API_KEY';
+  `https://${METERED_APP_NAME}.metered.live/api/v1/turn/credentials?apiKey=${METERED_API_KEY}`;
 
 // Static fallback — used if the Metered API fetch fails at startup.
 // These credentials expire (Metered rotates them), so the dynamic fetch above
-// is the primary path. Update these whenever you rotate your Metered account.
+// is the primary path. Update these whenever Metered rotates your account.
 const STATIC_ICE_FALLBACK = [
   { urls: 'stun:stun.relay.metered.ca:80' },
   {
@@ -125,8 +130,8 @@ const USAGE_REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
 let _cachedUsage = null; // { quotaInGB, usageInGB, overageInGB, fetchedAt }
 
 function fetchMeteredUsage() {
-  if (!METERED_SECRET_KEY || METERED_APP_NAME === 'YOUR_APP_NAME') {
-    console.log('[Usage] Metered secret key not configured — skipping usage fetch');
+  if (!METERED_SECRET_KEY) {
+    console.warn('[Usage] METERED_SECRET_KEY env var not set — monthly usage unavailable.');
     return Promise.resolve();
   }
 
@@ -158,7 +163,7 @@ function fetchMeteredUsage() {
 }
 
 fetchMeteredUsage().then(() => {
-  if (METERED_SECRET_KEY && METERED_APP_NAME !== 'YOUR_APP_NAME') {
+  if (METERED_SECRET_KEY) {
     setInterval(fetchMeteredUsage, USAGE_REFRESH_INTERVAL);
   }
 });
