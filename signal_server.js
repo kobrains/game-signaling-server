@@ -181,10 +181,18 @@ const httpServer = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/turn-usage') {
     res.setHeader('Content-Type', 'application/json');
     if (!_cachedUsage) {
-      // Not yet fetched (local mode or key not set) — return nulls so the
-      // monitor can show a "not available" state rather than crashing.
-      res.writeHead(200);
-      res.end(JSON.stringify({ quotaInGB: null, usageInGB: null, overageInGB: null, fetchedAt: null }));
+      // Cache is empty — either server just started, or secret key not set.
+      // If we have a key, attempt a fresh fetch now and wait for it rather
+      // than returning nulls (which causes the client to silently give up).
+      if (METERED_SECRET_KEY) {
+        fetchMeteredUsage().then(() => {
+          res.writeHead(200);
+          res.end(JSON.stringify(_cachedUsage ?? { quotaInGB: null, usageInGB: null, overageInGB: null, fetchedAt: null }));
+        });
+      } else {
+        res.writeHead(200);
+        res.end(JSON.stringify({ quotaInGB: null, usageInGB: null, overageInGB: null, fetchedAt: null }));
+      }
     } else {
       res.writeHead(200);
       res.end(JSON.stringify(_cachedUsage));
