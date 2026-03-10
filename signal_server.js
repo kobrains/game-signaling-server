@@ -1,3 +1,4 @@
+console.log('=== signal_server.js started ===', new Date().toISOString());
 const { WebSocketServer } = require('ws');
 const { randomUUID }       = require('crypto');
 const https                = require('https');
