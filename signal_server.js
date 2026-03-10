@@ -136,28 +136,37 @@ function fetchMeteredUsage() {
   }
 
   const url = `https://${METERED_APP_NAME}.metered.live/api/v1/turn/current_usage?secretKey=${METERED_SECRET_KEY}`;
+  console.log(`[Usage] Fetching from: https://${METERED_APP_NAME}.metered.live/api/v1/turn/current_usage`);
 
   return new Promise((resolve) => {
     https.get(url, (res) => {
       let data = '';
+      console.log(`[Usage] HTTP status: ${res.statusCode}`);
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
+        console.log('[Usage] Raw response:', data);
         try {
           const parsed = JSON.parse(data);
+          if (parsed.message) {
+            // Metered returned an error object
+            console.warn('[Usage] Metered API error:', parsed.message);
+            resolve();
+            return;
+          }
           if (typeof parsed.usageInGB === 'number') {
-            _cachedUsage = { ...parsed, fetchedAt: Date.now() };
-            console.log(`[Usage] Metered: ${parsed.usageInGB.toFixed(3)} GB / ${parsed.quotaInGB} GB`);
+            _cachedUsage = { quotaInGB: parsed.quotaInGB, usageInGB: parsed.usageInGB, overageInGB: parsed.overageInGB ?? 0, fetchedAt: Date.now() };
+            console.log(`[Usage] Metered: ${parsed.usageInGB.toFixed(4)} GB used / ${parsed.quotaInGB} GB quota`);
           } else {
-            console.warn('[Usage] Unexpected Metered response:', data);
+            console.warn('[Usage] Unexpected Metered response shape:', parsed);
           }
         } catch {
-          console.warn('[Usage] Failed to parse Metered usage response');
+          console.warn('[Usage] Failed to parse Metered response:', data);
         }
         resolve();
       });
     }).on('error', (err) => {
-      console.error('[Usage] Failed to fetch Metered usage:', err.message);
-      resolve(); // non-fatal
+      console.error('[Usage] HTTPS request failed:', err.message);
+      resolve();
     });
   });
 }
