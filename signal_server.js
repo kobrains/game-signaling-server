@@ -171,6 +171,10 @@ function fetchMeteredUsage() {
   });
 }
 
+// Startup diagnostic — shows exactly what the server has available
+console.log('[Config] METERED_APP_NAME:', METERED_APP_NAME);
+console.log('[Config] METERED_SECRET_KEY set:', METERED_SECRET_KEY ? `yes (${METERED_SECRET_KEY.length} chars)` : 'NO — set this Railway env var');
+
 fetchMeteredUsage().then(() => {
   if (METERED_SECRET_KEY) {
     setInterval(fetchMeteredUsage, USAGE_REFRESH_INTERVAL);
