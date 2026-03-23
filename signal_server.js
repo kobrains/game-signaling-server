@@ -5,17 +5,23 @@ const https                = require('https');
 const http                 = require('http');
 const os                   = require('os');
 
-// Railway (and most cloud platforms) inject a PORT env var.
-// Fall back to 3000 for local development.
-// Production: wss://game-signaling-server-production.up.railway.app
 const PORT = process.env.PORT || 3000;
 
-// Set RAILWAY_ENVIRONMENT (Railway injects this automatically) or LOCAL=true to skip Metered.
 const IS_LOCAL = !process.env.RAILWAY_ENVIRONMENT && !process.env.METERED_FORCE;
 
-// ─── LAN IP detection ─────────────────────────────────────────────────────────
-// Find the first non-loopback IPv4 address — this is the LAN address clients
-// on the same network should use to connect to this signaling server.
+function _requireEnv(name) {
+  const val = process.env[name];
+  if (!val) {
+    console.error(`[Config] FATAL: required environment variable "${name}" is not set. Refusing to start.`);
+    process.exit(1);
+  }
+  return val;
+}
+
+const METERED_APP_NAME = IS_LOCAL ? (process.env.METERED_APP_NAME || '') : _requireEnv('METERED_APP_NAME');
+const METERED_API_KEY  = IS_LOCAL ? (process.env.METERED_API_KEY  || '') : _requireEnv('METERED_API_KEY');
+const METERED_SECRET_KEY = process.env.METERED_SECRET_KEY || '';
+
 function getLanIp() {
   const ifaces = os.networkInterfaces();
   for (const name of Object.keys(ifaces)) {
@@ -23,68 +29,26 @@ function getLanIp() {
       if (iface.family === 'IPv4' && !iface.internal) return iface.address;
     }
   }
-  return '127.0.0.1'; // fallback: same machine only
+  return '127.0.0.1';
 }
 const LAN_IP = getLanIp();
 
-// ─── Metered configuration ────────────────────────────────────────────────────
-// App name and API key: used to fetch fresh TURN credentials (safe to expose
-// in the server — the API key only grants credential generation, not billing).
-// Secret key: used server-side ONLY to fetch billing usage. Never sent to clients.
-//
-// Railway env vars to set:
-//   METERED_SECRET_KEY  → Metered dashboard → Settings → Secret Key
-//   (METERED_APP_NAME and METERED_API_KEY are hardcoded below as they are not sensitive)
-const METERED_APP_NAME   = process.env.METERED_APP_NAME  || 'kobrains';
-const METERED_API_KEY    = process.env.METERED_API_KEY   || '6c5b137a20495ab54e4826914e11af12904c';
-const METERED_SECRET_KEY = process.env.METERED_SECRET_KEY || '';
+const METERED_API_URL = METERED_APP_NAME && METERED_API_KEY
+  ? `https://${METERED_APP_NAME}.metered.live/api/v1/turn/credentials?apiKey=${METERED_API_KEY}`
+  : null;
 
-// ─── Metered TURN credentials ─────────────────────────────────────────────────
-// Dynamic fetch — the signaling server fetches fresh short-lived credentials
-// from Metered on startup and every 12 hours. The API key is used here (not
-// the secret key). Credentials are sent to clients via the WebSocket JOIN_ROOM
-// response, so the secret key is never exposed to the browser.
-const METERED_API_URL =
-  `https://${METERED_APP_NAME}.metered.live/api/v1/turn/credentials?apiKey=${METERED_API_KEY}`;
-
-// Static fallback — used if the Metered API fetch fails at startup.
-// These credentials expire (Metered rotates them), so the dynamic fetch above
-// is the primary path. Update these whenever Metered rotates your account.
 const STATIC_ICE_FALLBACK = [
   { urls: 'stun:stun.relay.metered.ca:80' },
-  {
-    urls      : 'turn:global.relay.metered.ca:80',
-    username  : 'd1339c9f64c60c4b33b31b88',
-    credential: 'GTorfAcNMzcbffwu',
-  },
-  {
-    urls      : 'turn:global.relay.metered.ca:80?transport=tcp',
-    username  : 'd1339c9f64c60c4b33b31b88',
-    credential: 'GTorfAcNMzcbffwu',
-  },
-  {
-    urls      : 'turn:global.relay.metered.ca:443',
-    username  : 'd1339c9f64c60c4b33b31b88',
-    credential: 'GTorfAcNMzcbffwu',
-  },
-  {
-    urls      : 'turns:global.relay.metered.ca:443?transport=tcp',
-    username  : 'd1339c9f64c60c4b33b31b88',
-    credential: 'GTorfAcNMzcbffwu',
-  },
 ];
 
-// LAN/local ICE: empty array = browser generates host candidates automatically.
-// No STUN needed on a local network — STUN finds your public IP, not LAN IP.
-// Keeping this empty makes LAN connections faster and works on offline networks.
 const LOCAL_ICE = [];
 
-const ICE_REFRESH_INTERVAL = 12 * 60 * 60 * 1000; // 12 hours
+const ICE_REFRESH_INTERVAL = 12 * 60 * 60 * 1000;
 
-let _cachedIceServers = LOCAL_ICE; // safe default for local; replaced by Metered on Railway
+let _cachedIceServers = LOCAL_ICE;
 
 function fetchIceServers() {
-  if (IS_LOCAL) {
+  if (IS_LOCAL || !METERED_API_URL) {
     console.log('[ICE] Local mode -- host candidates only, Metered skipped');
     return Promise.resolve();
   }
@@ -112,7 +76,7 @@ function fetchIceServers() {
     }).on('error', (err) => {
       console.error('[ICE] Failed to fetch from Metered:', err.message, '-- using static fallback');
       _cachedIceServers = STATIC_ICE_FALLBACK;
-      resolve(); // non-fatal
+      resolve();
     });
   });
 }
@@ -121,18 +85,13 @@ fetchIceServers().then(() => {
   if (!IS_LOCAL) setInterval(fetchIceServers, ICE_REFRESH_INTERVAL);
 });
 
-// ─── Metered TURN usage ───────────────────────────────────────────────────────
-// Fetches real billing-cycle usage from Metered and caches it server-side.
-// Clients poll GET /turn-usage — the signaling server proxies so the secret key
-// never leaves the server.
+const USAGE_REFRESH_INTERVAL = 5 * 60 * 1000;
 
-const USAGE_REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
-
-let _cachedUsage = null; // { quotaInGB, usageInGB, overageInGB, fetchedAt }
+let _cachedUsage = null;
 
 function fetchMeteredUsage() {
-  if (!METERED_SECRET_KEY) {
-    console.warn('[Usage] METERED_SECRET_KEY env var not set — monthly usage unavailable.');
+  if (!METERED_SECRET_KEY || !METERED_APP_NAME) {
+    console.warn('[Usage] METERED_SECRET_KEY or METERED_APP_NAME not set — monthly usage unavailable.');
     return Promise.resolve();
   }
 
@@ -149,13 +108,17 @@ function fetchMeteredUsage() {
         try {
           const parsed = JSON.parse(data);
           if (parsed.message) {
-            // Metered returned an error object
             console.warn('[Usage] Metered API error:', parsed.message);
             resolve();
             return;
           }
           if (typeof parsed.usageInGB === 'number') {
-            _cachedUsage = { quotaInGB: parsed.quotaInGB, usageInGB: parsed.usageInGB, overageInGB: parsed.overageInGB ?? 0, fetchedAt: Date.now() };
+            _cachedUsage = {
+              quotaInGB  : parsed.quotaInGB,
+              usageInGB  : parsed.usageInGB,
+              overageInGB: parsed.overageInGB ?? 0,
+              fetchedAt  : Date.now(),
+            };
             console.log(`[Usage] Metered: ${parsed.usageInGB.toFixed(4)} GB used / ${parsed.quotaInGB} GB quota`);
           } else {
             console.warn('[Usage] Unexpected Metered response shape:', parsed);
@@ -172,9 +135,8 @@ function fetchMeteredUsage() {
   });
 }
 
-// Startup diagnostic — shows exactly what the server has available
-console.log('[Config] METERED_APP_NAME:', METERED_APP_NAME);
-console.log('[Config] METERED_SECRET_KEY set:', METERED_SECRET_KEY ? `yes (${METERED_SECRET_KEY.length} chars)` : 'NO — set this Railway env var');
+console.log('[Config] METERED_APP_NAME:', METERED_APP_NAME || '(not set — local mode)');
+console.log('[Config] METERED_SECRET_KEY set:', METERED_SECRET_KEY ? `yes (${METERED_SECRET_KEY.length} chars)` : 'NO');
 
 fetchMeteredUsage().then(() => {
   if (METERED_SECRET_KEY) {
@@ -182,22 +144,13 @@ fetchMeteredUsage().then(() => {
   }
 });
 
-// ─── HTTP + WebSocket server ──────────────────────────────────────────────────
-// A single HTTP server handles both:
-//   GET /turn-usage  → proxied Metered usage (JSON, CORS-open for localhost dev)
-//   All other paths  → WebSocket upgrade for signaling
-
 const httpServer = http.createServer((req, res) => {
-  // CORS headers — the game client is a browser file:// or localhost origin
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
 
   if (req.method === 'GET' && req.url === '/turn-usage') {
     res.setHeader('Content-Type', 'application/json');
     if (!_cachedUsage) {
-      // Cache is empty — either server just started, or secret key not set.
-      // If we have a key, attempt a fresh fetch now and wait for it rather
-      // than returning nulls (which causes the client to silently give up).
       if (METERED_SECRET_KEY) {
         fetchMeteredUsage().then(() => {
           res.writeHead(200);
@@ -214,16 +167,33 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  // All other HTTP requests: 404
   res.writeHead(404);
   res.end('Not found');
 });
 
-// ─── Limits ───────────────────────────────────────────────────────────────────
-const MAX_ROOM_SIZE      = 8;
-const MAX_ROOM_ID_LEN    = 64;
-const RATE_LIMIT_WINDOW  = 1000; // ms
-const RATE_LIMIT_MAX_MSG = 30;
+const MAX_ROOM_SIZE        = 8;
+const MAX_ROOM_ID_LEN      = 64;
+const RATE_LIMIT_WINDOW    = 1000;
+const RATE_LIMIT_MAX_MSG   = 30;
+const MAX_CONNECTIONS_PER_IP = 8;
+
+const _ipConnectionCounts = new Map();
+
+function _ipConnectAllow(ip) {
+  const count = _ipConnectionCounts.get(ip) ?? 0;
+  if (count >= MAX_CONNECTIONS_PER_IP) return false;
+  _ipConnectionCounts.set(ip, count + 1);
+  return true;
+}
+
+function _ipConnectRelease(ip) {
+  const count = _ipConnectionCounts.get(ip) ?? 0;
+  if (count <= 1) {
+    _ipConnectionCounts.delete(ip);
+  } else {
+    _ipConnectionCounts.set(ip, count - 1);
+  }
+}
 
 const wss = new WebSocketServer({ server: httpServer });
 
@@ -234,9 +204,7 @@ httpServer.listen(PORT, () => {
   console.log(`Signaling server running on port ${PORT} -- ${mode}`);
 });
 
-const rooms = new Map(); // roomId -> Set of sockets
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+const rooms = new Map();
 
 function sanitiseRoomId(raw) {
   if (typeof raw !== 'string') return '';
@@ -253,8 +221,17 @@ function rateAllow(ws) {
   return ws._rateBucketCount <= RATE_LIMIT_MAX_MSG;
 }
 
-// ─── Server ───────────────────────────────────────────────────────────────────
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0].trim()
+    ?? req.socket.remoteAddress
+    ?? 'unknown';
+
+  if (!_ipConnectAllow(ip)) {
+    console.warn(`[Server] Connection refused — IP ${ip} exceeded limit of ${MAX_CONNECTIONS_PER_IP}`);
+    ws.close(1008, 'Too many connections from your IP');
+    return;
+  }
+
   let currentRoom = null;
 
   ws._rateBucketStart = Date.now();
@@ -283,8 +260,6 @@ wss.on('connection', (ws) => {
       const peerId = randomUUID();
       ws._peerId = peerId;
 
-      // Send peer ID, ICE servers, and (in local mode) the LAN address so the
-      // client UI can display the exact URL other players should connect to.
       ws.send(JSON.stringify({
         type      : 'ASSIGNED_PEER_ID',
         peerId,
@@ -314,6 +289,7 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    _ipConnectRelease(ip);
     if (currentRoom && rooms.has(currentRoom)) {
       rooms.get(currentRoom).delete(ws);
       if (rooms.get(currentRoom).size === 0) rooms.delete(currentRoom);
