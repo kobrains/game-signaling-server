@@ -7,7 +7,7 @@ const os                   = require('os');
 
 const PORT = process.env.PORT || 3000;
 
-const IS_LOCAL = !process.env.RAILWAY_ENVIRONMENT_NAME && !process.env.METERED_FORCE;
+const IS_LOCAL = process.env.NODE_ENV !== 'production';
 
 function _requireEnv(name) {
   const val = process.env[name];
